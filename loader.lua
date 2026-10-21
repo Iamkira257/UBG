@@ -1,4 +1,32 @@
 --============================================================================
+--  v5 2026-10-20  -  what changed, and the measurement behind each one
+--
+--  1. THE DASH KEY IS READ, NOT ASSUMED. Build 4 pressed Space. The game's own
+--     keybind widget reads Dash=X on this account (LightAttack=K, HeavyAttack=L,
+--     Block=F), so every Space press went to a key the game does not bind. That
+--     is the whole explanation for "6 of 25 registered": it was not timing, it
+--     was a dead key. _G.D.key() prints what was read; cfg.dodgeKey is only the
+--     fallback when the widget cannot be read.
+--
+--  2. FEINTS ARE DETECTED BY SOUND. Measured live by diffing Workspace.Debris
+--     every 15ms: a feint writes Feint + Feint2 + FeintRustle into Debris.
+--     SoundPart ~50ms after the attempt, while the IsFeinting stamp this file
+--     used to veto on is written 330-400ms after it. ~300ms earlier, no clock
+--     needed. Nothing on a Sound is readable here except Name/ClassName/Parent/
+--     Address, so a cue is a NEW INSTANCE tracked by Address.
+--
+--  3. A FEINT IS ANSWERED WITH A PUNCH. A fake has no hitbox, so dodging it is
+--     the fake paying off. The counter presses the light attack (K, read from
+--     the same widget) into the recovery the fake leaves behind, twice if the
+--     first produces no impact sound, and the game's own <me>Hit sound is what
+--     says COUNTER LANDED. One fake gets one answer: the sound and the stamp
+--     are the same attempt, so the stamp is ignored for feintOnceMs after a
+--     counter (measured live: without that, one fake cost four punches).
+--
+--  4. The dodge is held off for the rest of the fake (counterHoldOffMs) so the
+--     repeat press does not spend 12 stamina on the fake the counter saved; the
+--     hold ends early on the real punch's own Swing sound.
+--============================================================================
 --  BOXING DODGE  v2   -   Untitled Boxing Game        rewrite  2026-10-18
 --  console only, no GUI.  Supersedes dodge.lua (restarts 1-25) and the probe
 --  half of boxing.lua.  _G.D is the whole interface.
@@ -205,6 +233,8 @@
 --    _G.D.dir("left")         one manual dodge, to test the mapping by hand
 --    _G.D.presstest()         one Space press, judged by the game's ledger
 --    _G.D.spam()              DashSpamLevel seen at presses and registrations
+--    _G.D.hl()                the startup-highlight clock: edges, the learned
+--                             delay, the token lag, and ShinyStartups
 --    _G.D.land()              per-opponent landing offsets and the fuse they imply
 --    _G.D.dump()              opponent + own attributes, one screen
 --    _G.D.caps()              what this build can read and press
@@ -253,7 +283,14 @@ end)
 -- every number here was measured; every one is live through _G.D.set()
 local cfg = {
 	auto            = true,
-	dodgeKey        = "Space",
+	-- THE DASH KEY, READ OUT OF THE GAME. It was assumed to be Space for three
+	-- builds; on 2026-10-20 the game's own keybind widget (PlayerGui.Common.
+	-- Keybinds ... Dash.Press.Key) read X, so every press this file sent was
+	-- going to a key the game does not bind. readKeybinds=true reads it at boot
+	-- and _G.D.key() prints what it found; this default is only the fallback.
+	dodgeKey        = "X",
+	readKeybinds    = true,
+	keybindRetryMs  = 4000,
 	forwardKey      = "W",
 	leftKey         = "A",
 	rightKey        = "D",
@@ -314,6 +351,38 @@ local cfg = {
 	coverMarginMs   = 80,
 	feintGuardMs    = 165,
 
+	-- THE STARTUP HIGHLIGHT. The game parents a Highlight named
+	-- StartupHighlight into the welded copy of every rig
+	-- (Workspace.Welds.<name>.WeldCharacter) for the attack itself, and it is
+	-- and Workspace.Settings.ShinyStartups is the setting it is named after -
+	-- but measured on a live server it kept appearing with that setting OFF, so
+	-- it is reported and never used as a gate. It is a plain "does this child
+	-- exist" check, it is published at the attack, and it is what the short
+	-- script in the wild presses on - which is why that script beats this file
+	-- on timing with twenty lines. The edge is now the clock, its delay is
+	-- learned from this opponent's own landings, and the feint veto this file
+	-- already had still runs before the press (the short script has no feint
+	-- tell, which is its only weakness).
+	startupClock    = true,  -- false = the token clock only
+	-- WHICH ENGINE PRESSES. "startup" is the one the measurements chose: the
+	-- edge, a bare Space, and another press every 350ms while the highlight is
+	-- still up - which is what the short script in the wild does every loop,
+	-- and is why it recovers from a refused press instead of losing the window.
+	-- It has no dash-gap gate, because a refused press costs 1 stamina of 100
+	-- (measured: 81.19 -> 80.19) while a WITHHELD press costs the whole attack:
+	-- v3 withheld 8 windows and registered 6 of 25; the bare engine below
+	-- registered 5 of 7 in the same client, mid-fight. "fuse" is the old
+	-- measured-window engine, kept whole and still selectable.
+	engine          = "startup",  -- startup | fuse
+	startupRepeatMs = 350,   -- while the highlight is up, press again no sooner
+	startupHoldMs   = 100,   -- the short script holds Space 100ms
+	startupMs       = 250,   -- the short script's own delay: the default until
+	                         -- this opponent has landed on the startup clock
+	startupMinMs    = 120,
+	startupMaxMs    = 460,
+	startupAdoptMs  = 140,   -- a token this soon after the edge is the SAME
+	                         -- attack arriving late, not a new window
+
 	-- heavies
 	heavyExtraMs    = 50,
 	heavyLateGapMs  = 60,
@@ -336,6 +405,54 @@ local cfg = {
 	-- It is cut back automatically when their measured landing says the wait
 	-- would put the press too late to matter (the log says when and why).
 	feintPatienceMs = 25,
+
+	-- SOUND. Measured live on 2026-10-20 by diffing Workspace.Debris every 15ms
+	-- through a real 1v1 on this build:
+	--   attack start  Debris.<name>Start exists, then <name>Start/Step ~50ms
+	--                 AFTER the attempt, Swing/SwingBig ~130ms after it
+	--   landing       <name>Hit/Hit1 | Heavy1 | Crush | GuardHit
+	--   FEINT         Feint + Feint2 + FeintRustle land in Debris.SoundPart in
+	--                 the same 50ms, ~50ms after the fake started, and ~370ms
+	--                 BEFORE the real punch behind it
+	-- So the feint SOUND is a tell ~300ms earlier than the IsFeinting stamp
+	-- (measured 330-400ms late), and it needs no clock. Only existence, Name,
+	-- ClassName and Address are readable on a Sound here - Playing, SoundId and
+	-- TimeLength all read nil - so a cue is a NEW INSTANCE in Debris, tracked by
+	-- Address, because two reads of one instance never compare equal.
+	soundCues       = true,
+	soundFeintWindowMs = 700,  -- how long a feint cue stays actionable
+	-- A cue is only believed when an ATTACK TOKEN changed just before it. The
+	-- reason is measured: the game re-creates Debris.SoundPart now and then, and
+	-- whatever feint sounds were still parented to it turn up as "new" again -
+	-- two of those landed 947ms after an attack edge in a live fight. A real cue
+	-- is written ~50ms after its own token, so this window is generous.
+	soundFeintTokenMs = 320,
+	-- ...and the cue has to belong to THAT token: a cue older than the token by
+	-- more than this is from the attempt before it. Measured live: a replayed
+	-- cue 543ms old got credited to a token that changed 274ms later.
+	soundFeintLeadMs = 120,
+
+	-- COUNTER-PUNCH. A feint has no hitbox, so the correct answer to one is not
+	-- a dodge (a dodge is what the fake was asking for) - it is a punch, thrown
+	-- into the recovery the fake leaves behind. The light attack is bound to K
+	-- in the same keybind widget the dash key was read from.
+	counter         = true,
+	counterKey      = "K",
+	counterHoldMs   = 55,
+	counterSecondMs = 170,  -- second punch if the first produced no hit sound
+	counterWatchMs  = 520,  -- how long the game's hit sound is watched for
+	-- A counter must not be followed by a dodge of the SAME fake: the highlight
+	-- stays up through the feint, so the engine would otherwise press on it
+	-- 110ms later and spend the dodge the counter just saved. This holds the
+	-- dodge off for the rest of that attempt; a real punch behind the fake is a
+	-- NEW edge and starts its own clock. Measured gap from the fake to the real
+	-- punch: 370ms.
+	counterHoldOffMs = 1200,
+	-- ONE FAKE, ONE ANSWER, and this is the window that decides it. The sound
+	-- cue and the IsFeinting stamp describe the same attempt 300-400ms apart, so
+	-- without this a single fake got FOUR punches in a live fight (25.80s sound,
+	-- 26.16s stamp, two each).
+	feintOnceMs     = 1200,
 
 	-- when NOT to dodge
 	minStamina      = 12,
@@ -381,13 +498,18 @@ local cfg = {
 -- and "Matcha:638: attempt to call a nil value" is indistinguishable between
 -- them. _G.D.build() answers which one is loaded, so a line number in an error
 -- can be matched to the right source instead of guessed at.
-local BUILD = "v2.3 2026-10-18 rink-gate + feint-patience"
+local BUILD = "v5.0 2026-10-20 sound feint -> counter-punch, dash key read from the game"
 
 -- keypress shapes. vk is the shape that has worked; Enum/lower/upper are tried
 -- by keytest() because a build can accept exactly one of them.
 local VK = {
 	Space = 0x20, W = 0x57, A = 0x41, S = 0x53, D = 0x44,
-	Shift = 0x10, Q = 0x51, E = 0x45, F = 0x46, R = 0x52,
+	Shift = 0x10, LeftShift = 0x10, Q = 0x51, E = 0x45, F = 0x46, R = 0x52,
+	-- X is the game's DASH and K is its LIGHT ATTACK (both read from the
+	-- keybind widget, not guessed). A key missing from this table is a press
+	-- that fails at argFor() and is counted as INPUT.failed - which is exactly
+	-- what happened to every press while dash was assumed to be Space.
+	X = 0x58, K = 0x4B, L = 0x4C, C = 0x43, V = 0x56, G = 0x47, Z = 0x5A,
 }
 local FORMS = { "Enum", "lower", "upper", "vk" }
 local STATES = "States"
@@ -757,6 +879,10 @@ local counters = {
 	exchanges = 0, presses = 0, registered = 0, unregistered = 0,
 	perfect = 0, hit = 0, clean = 0, late = 0, skipped = 0,
 	feint = 0, feintLate = 0, rearm = 0, cover = 0, retry = 0,
+	hlPress = 0, feintHl = 0,
+	-- feints caught by each tell, and the punches thrown instead of a dodge
+	feintSound = 0, feintStamp = 0,
+	counter = 0, counterHit = 0, counterMiss = 0,
 	dirOk = 0, dirBad = 0, dirUnknown = 0, neededUsed = 0, neededMoved = 0,
 	stunWait = 0, stunHeld = 0, staleStun = 0, stalePress = 0,
 	-- presses NOT sent because this character is not on the canvas
@@ -767,11 +893,85 @@ local counters = {
 	poff = {},
 }
 
+-- ONE FAKE, ONE ANSWER. The sound cue and the IsFeinting stamp describe the SAME
+-- attempt 300ms apart, so without this the file throws four punches at one fake:
+-- measured live at 25.80s (sound) and 26.16s (stamp), both counting. ANSWERED.at
+-- is when a counter last went out; a stamp inside the hold is the same fake
+-- arriving late, not a second one.
+local ANSWERED = { at = nil, skips = 0 }
+
 local function lp()
 	if PLR == nil then return nil end
 	local ok, p = pcall(function() return PLR.LocalPlayer end)
 	if ok then return p end
 	return nil
+end
+
+--========================= THE REAL KEYBINDS ===============================
+-- This file guessed its keys for three builds and guessed wrong. The game
+-- publishes your actual binds in its own keybind widget, and they are plain
+-- TextLabels - readable here - so the keys are READ:
+--
+--   PlayerGui.Common.Keybinds.Main.Scroll.Controls.Keybinds.<Action>.Press.Key
+--
+-- Measured on this account 2026-10-20: Dash=X, LightAttack=K, HeavyAttack=L,
+-- Block=F, Ultimate=Q, Special=R, QuickStep=LeftShift. Space was bound to
+-- nothing, so every "bare Space" press in build 4 was sent to a dead key - the
+-- registrations that did happen were the game reading a different input path,
+-- and that is why the numbers never held up.
+local KEYS = { dash = nil, light = nil, heavy = nil, block = nil, quick = nil,
+	from = "cfg default", at = nil, read = 0 }
+
+local function keybindText(action)
+	local p = lp()
+	if p == nil then return nil end
+	local pg = nil
+	pcall(function() pg = p:FindFirstChild("PlayerGui") end)
+	if pg == nil then return nil end
+	local node = pg
+	for _, step in ipairs({ "Common", "Keybinds", "Main", "Scroll", "Controls", "Keybinds", action, "Press", "Key" }) do
+		if node == nil then return nil end
+		local nxt = nil
+		pcall(function() nxt = node:FindFirstChild(step) end)
+		node = nxt
+	end
+	if node == nil then return nil end
+	local text = nil
+	pcall(function() text = node.Text end)
+	if type(text) ~= "string" then return nil end
+	text = string.gsub(text, "%s", "")
+	if #text == 0 or #text > 12 then return nil end
+	-- Shift is one key with two names, and VK only has one of them
+	if text == "LeftShift" or text == "RightShift" then return "Shift" end
+	if #text == 1 then return string.upper(text) end
+	return text
+end
+
+local function readKeybinds(quiet)
+	KEYS.at = now()
+	local dash, light = keybindText("Dash"), keybindText("LightAttack")
+	local got = 0
+	if dash ~= nil and VK[dash] ~= nil then
+		KEYS.dash, KEYS.from, got = dash, "the game's keybind widget", got + 1
+		cfg.dodgeKey = dash
+	elseif dash ~= nil then
+		if not quiet then
+			log(string.format("KEYBINDS: Dash is bound to %s, which this file has no virtual key code for - keeping %s. _G.D.caps() lists what it sends.", dash, tostring(cfg.dodgeKey)))
+		end
+	end
+	if light ~= nil and VK[light] ~= nil then
+		KEYS.light, cfg.counterKey = light, light
+		got = got + 1
+	end
+	KEYS.heavy = keybindText("HeavyAttack")
+	KEYS.block = keybindText("Block")
+	KEYS.quick = keybindText("QuickStep")
+	KEYS.read = got
+	if not quiet and got > 0 then
+		log(string.format("KEYBINDS read from the game: dash=%s counter=%s heavy=%s block=%s. These are the keys the presses use - nothing here is assumed any more.",
+			tostring(cfg.dodgeKey), tostring(cfg.counterKey), tostring(KEYS.heavy or "?"), tostring(KEYS.block or "?")))
+	end
+	return got
 end
 
 local function myName()
@@ -929,6 +1129,338 @@ local function refresh()
 		WORLD.tok = nil
 	end
 	return opp
+end
+
+--======================== THE STARTUP HIGHLIGHT ============================
+-- The game's own marker for "an attack has started": a Highlight named
+-- StartupHighlight, parented into the welded copy of the rig for as long as the
+-- swing runs (measured at 570-680ms on a live server), created only while
+-- Workspace.Settings.ShinyStartups is on. None of its properties are readable in
+-- this executor - only that it exists - and that is enough: the EDGE is the
+-- clock, and what the attempt really is gets decided by the attributes this
+-- file already reads.
+--
+-- Measured on the live server while writing this: the edge lands within one poll
+-- of TryAttack (the token changed with the highlight on the same tick in 10 of
+-- 12 edges), so this is not an earlier signal so much as an earlier CLOCK - the
+-- exists-check is the cheapest read available, so the window starts before the
+-- twelve attribute reads the token path needs, instead of after them. That is
+-- the fifty milliseconds the log kept finding between the fuse and the press.
+local HL = { rig = nil, rigName = nil, on = false, at = nil, seen = 0,
+	fire = {}, lead = {}, setting = nil, settingAt = nil }
+
+local function hlSetting()
+	if HL.settingAt ~= nil and (now() - HL.settingAt) < 5 then return HL.setting end
+	HL.settingAt = now()
+	local v = nil
+	pcall(function()
+		local ws = workspace
+		local folder = ws and ws:FindFirstChild("Settings")
+		local flag = folder and folder:FindFirstChild("ShinyStartups")
+		if flag ~= nil then v = safe(flag, "Value") end
+	end)
+	HL.setting = v
+	return v
+end
+
+-- the rig the game parents the highlight into. Cached per opponent name: the
+-- weld row is stable for a whole fight, so this is one FindFirstChild per fight
+-- after the first tick.
+local function hlRigFor(model, name)
+	if name == nil then return nil end
+	if HL.rigName == name and HL.rig ~= nil and safe(HL.rig, "Parent") ~= nil then
+		return HL.rig
+	end
+	local rig = nil
+	pcall(function()
+		local ws = workspace
+		local folder = ws and ws:FindFirstChild("Welds")
+		local row = folder and folder:FindFirstChild(name)
+		rig = row and row:FindFirstChild("WeldCharacter")
+	end)
+	if rig ~= nil then
+		HL.rig, HL.rigName = rig, name
+	end
+	return rig
+end
+
+local function hlUp(opp)
+	local rig = hlRigFor(opp and opp.model, opp and opp.name)
+	if rig == nil then return false end
+	local sh = nil
+	pcall(function() sh = rig:FindFirstChild("StartupHighlight") end)
+	return sh ~= nil
+end
+
+-- the rising edge, and the clock. The highlight stays up for the whole swing,
+-- so a second punch thrown while it is still up is the TOKEN's job - this fires
+-- once per attack, not once per frame.
+local function hlEdge(opp)
+	local up = hlUp(opp)
+	if up and not HL.on then
+		HL.on, HL.at = true, now()
+		HL.seen = HL.seen + 1
+		return HL.at
+	end
+	if (not up) and HL.on then HL.on = false end
+	return nil
+end
+
+-- how late the token was behind the edge. Only used for the report - the clock
+-- never waits for the token.
+local function noteLead(ms)
+	if ms == nil or ms < 0 or ms > 400 then return end
+	HL.lead[#HL.lead + 1] = ms
+	while #HL.lead > 12 do table.remove(HL.lead, 1) end
+end
+
+local function hlLine()
+	local fire = medianOf(HL.fire)
+	local lead = medianOf(HL.lead)
+	return string.format("startup highlight: ShinyStartups=%s rig=%s up=%s edges=%d presses=%d feint-cancels=%d delay=%s lead=%s",
+		tostring(hlSetting()), tostring(HL.rigName or "-"), tostring(HL.on),
+		HL.seen, counters.hlPress, counters.feintHl,
+		fire and string.format("%.0fms (n=%d)", fire, #HL.fire) or ("default " .. cfg.startupMs .. "ms"),
+		lead and string.format("%.0fms (n=%d)", lead, #HL.lead) or "unmeasured")
+end
+
+--======================== SOUND: THE GAME'S OWN CUES =======================
+-- Measured live on 2026-10-20 by diffing Workspace.Debris every 15ms through a
+-- real 1v1 on this build. What the game actually creates, and when:
+--
+--   [1.50s] Axel_2576Start/Step                 my attack, 50ms after it began
+--   [1.63s] Axel_2576Start/SwingBig             130ms after it began
+--   [1.77s] Axel_2576Hit/Crush + HeavyLayer + SurgeonHeadHit   my heavy LANDED
+--   [6.30s] victor64_BStart/Step                their attack began
+--   [6.35s] SoundPart/Feint + Feint2 + FeintRustle   THEIR ATTEMPT WAS A FAKE
+--   [6.72s] victor64_BStart/Step                the real punch behind it
+--   [6.83s] victor64_BStart/SwingBig             ...and it swung 480ms after the fake
+--
+-- That is the whole reason for this section: the feint cue is ~50ms after the
+-- attempt, while IsFeinting - the tell build 4 vetoed on - is written 330-400ms
+-- after it (measured, and it is exactly what a feint is built to exploit).
+-- Sound is therefore the earliest feint tell this file has, and it needs no
+-- clock, no token and no highlight.
+--
+-- The constraint that shapes the code: on this executor NOTHING on a Sound is
+-- readable except Name, ClassName, Parent and Address. .Playing, .TimeLength
+-- and .SoundId all read nil (checked). So a cue is a NEW INSTANCE appearing in
+-- Debris, not a playback state - and instances are tracked by Address, because
+-- two reads of the same instance do not compare equal but their addresses do.
+local SND_FEINT_CUE = { Feint = true, Feint2 = true, FeintRustle = true }
+local SND_HIT_CUE = { Hit1 = true, Heavy1 = true, Crush = true, GuardHit = true,
+	Counter = true, FastHit = true, SharpHit = true, HitLayer = true }
+local SND_SWING_CUE = { Swing = true, SwingBig = true, Step = true }
+
+-- the attempt clock the sound cue is judged against. Separate from WORLD.tok
+-- on purpose: the fuse engine consumes that one to decide its own windows, and
+-- writing it from the tick would eat the change it is waiting for.
+local TOKN = { v = nil, at = nil }
+
+local SND = {
+	root = nil, seen = {}, primed = false, cues = {}, n = 0,
+	stale = 0,
+	feints = 0, swings = 0, hits = 0, steps = 0, scans = 0,
+	lastFeintAt = nil, lastFeintName = nil, claimed = nil,
+	lastSwingAt = nil, lastOppHitAt = nil, lastMyHitAt = nil,
+	lastCounterCueAt = nil, lastCounterAt = nil,
+	counterLanded = 0, counterMissed = 0,
+}
+
+local function sndDebris()
+	local d = SND.root
+	if d ~= nil and safe(d, "Parent") ~= nil then return d end
+	d = nil
+	pcall(function()
+		local ws = workspace
+		if ws ~= nil then d = ws:FindFirstChild("Debris") end
+	end)
+	SND.root = d
+	return d
+end
+
+-- one cue, with the only attribution available: the container's own name.
+-- "<opponent>Start" / "<opponent>Hit" are theirs, "<me>Start" are mine, and
+-- SoundPart is the shared one the game uses for feints, steps and counter hits.
+local function sndCue(name, holder, owner)
+	if type(name) ~= "string" then return end
+	local at = now()
+	SND.n = SND.n + 1
+	SND.cues[#SND.cues + 1] = { n = name, h = holder, o = owner, t = at }
+	while #SND.cues > 40 do table.remove(SND.cues, 1) end
+	if SND_FEINT_CUE[name] == true and owner ~= "me" then
+		SND.feints = SND.feints + 1
+		SND.lastFeintAt, SND.lastFeintName = at, name
+		-- one line per fake, not one per cue: the game writes three of them on
+		-- the same tick
+		if name == "Feint" then
+			-- only the fresh ones are worth a line. The game re-creates
+			-- Debris.SoundPart and replays its leftover Feint children as "new"
+			-- instances; those arrive seconds after any token and are counted,
+			-- not printed (measured at 947ms, 2008ms and 4932ms after the token).
+			local tokAge = TOKN.at and (at - TOKN.at) or nil
+			if tokAge ~= nil and tokAge >= 0 and tokAge <= (cfg.soundFeintTokenMs / 1000) then
+				log(string.format("SOUND %s/%s - THE FEINT CUE, %.0fms after the attack token. The stamp this file used to wait for lands 330-400ms late; this is the same news ~300ms earlier.",
+					holder, name, tokAge * 1000))
+			else
+				SND.stale = SND.stale + 1
+			end
+		end
+		return
+	end
+	if SND_HIT_CUE[name] == true then
+		SND.hits = SND.hits + 1
+		if owner == "me" then
+			SND.lastMyHitAt = at
+		elseif owner == "opp" then
+			SND.lastOppHitAt = at
+		elseif name == "Counter" then
+			SND.lastCounterCueAt = at
+		end
+		return
+	end
+	if SND_SWING_CUE[name] == true and owner == "opp" then
+		SND.swings = SND.swings + 1
+		SND.lastSwingAt = at
+	end
+end
+
+-- the poll. Costs one GetChildren on Debris plus one on the three or four
+-- containers that can hold a sound this tick - not a tree walk, and not one
+-- GetChildren per part in the map.
+local function sndPoll(oppName)
+	if cfg.soundCues ~= true then return end
+	local root = sndDebris()
+	if root == nil then return end
+	local kids = nil
+	if not pcall(function() kids = root:GetChildren() end) or kids == nil then return end
+	local mine = myName()
+	local nextSeen = {}
+	for i = 1, #kids do
+		local c = kids[i]
+		local cname = safe(c, "Name")
+		if type(cname) ~= "string" then cname = "?" end
+		local ca = safe(c, "Address")
+		local ckey = ca and tostring(ca) or ("?" .. i)
+		nextSeen[ckey] = true
+		-- only the containers that carry sounds in the measurement
+		local scan = (string.sub(cname, -5) == "Start")
+			or (string.sub(cname, -3) == "Hit")
+			or (cname == "SoundPart")
+		if scan then
+			local owner = "other"
+			if oppName ~= nil and string.find(cname, oppName, 1, true) ~= nil then
+				owner = "opp"
+			elseif mine ~= nil and string.find(cname, mine, 1, true) ~= nil then
+				owner = "me"
+			elseif cname == "SoundPart" then
+				owner = "shared"
+			end
+			local sub = nil
+			if pcall(function() sub = c:GetChildren() end) and sub ~= nil then
+				for j = 1, #sub do
+					local s = sub[j]
+					if safe(s, "ClassName") == "Sound" then
+						local sa = safe(s, "Address")
+						local sk = sa and tostring(sa) or (ckey .. "/" .. j)
+						nextSeen[sk] = true
+						if SND.seen[sk] ~= true then
+							-- "shared" is passed as "?": the feint cue has no owner
+							-- in its name, so whether it is theirs is decided by the
+							-- attack edge it arrives on (see soundFeint)
+							sndCue(tostring(safe(s, "Name")), cname, (owner == "shared") and "?" or owner)
+						end
+					end
+				end
+			end
+		end
+	end
+	SND.seen = nextSeen
+	SND.scans = SND.scans + 1
+	SND.primed = true
+end
+
+-- Is the feint cue live, and does it belong to an attack that is actually
+-- running? The cue is written ~50ms after the attempt, so the highlight is up
+-- in the measured case; the 150ms grace exists for the frames where it is not.
+local function soundFeint()
+	if cfg.soundCues ~= true then return nil end
+	local at = SND.lastFeintAt
+	if at == nil then return nil end
+	local age = now() - at
+	if age < 0 or age > (cfg.soundFeintWindowMs / 1000) then return nil end
+	if SND.claimed == at then return nil end
+	-- an attack token has to have moved just before the cue. Without this, a
+	-- re-created Debris.SoundPart replays its leftover Feint children as new
+	-- cues long after the attack they belonged to (measured: 947ms and 1924ms).
+	local fresh = nil
+	local tokAge = (TOKN.at ~= nil) and (now() - TOKN.at) or nil
+	if tokAge ~= nil then
+		fresh = (tokAge >= 0 and tokAge <= (cfg.soundFeintTokenMs / 1000))
+		-- the cue comes ~50ms AFTER its own token (measured), so one that is
+		-- older than the token by more than the tolerance is a replay
+		if fresh and (age - tokAge) > (cfg.soundFeintLeadMs / 1000) then fresh = false end
+	else
+		fresh = HL.on or age <= 0.15
+	end
+	if not fresh then return nil end
+	SND.claimed = at
+	return string.format("%s sound %.0fms ago, attempt %.0fms old",
+		tostring(SND.lastFeintName), age * 1000, tokAge and (tokAge * 1000) or -1)
+end
+
+--=========================== THE COUNTER-PUNCH =============================
+-- A feint has no hitbox. Dodging one is the fake paying off; the correct answer
+-- is a punch thrown into the recovery the fake leaves behind - and the game's
+-- own impact sound says whether it landed, which is the only outcome that
+-- matters for a counter.
+local function counterPunch(name, why)
+	local at = now()
+	SND.lastCounterAt = at
+	counters.counter = counters.counter + 1
+	press(cfg.counterKey, true, "counter")
+	local hold = now() + (cfg.counterHoldMs / 1000)
+	while now() < hold do end
+	press(cfg.counterKey, false, "counter")
+	log(string.format("COUNTER %s - %s, so %s goes out instead of a dodge (%dms hold). A fake has no hitbox; the real punch behind it still gets its own edge.",
+		name, why, cfg.counterKey, cfg.counterHoldMs))
+	task.spawn(function()
+		local second = false
+		local secondAt = at + (cfg.counterSecondMs / 1000)
+		local until_ = at + (cfg.counterWatchMs / 1000)
+		local landedAt = nil
+		while now() < until_ do
+			if landedAt == nil then
+				local mine = SND.lastMyHitAt
+				local counterCue = SND.lastCounterCueAt
+				if mine ~= nil and mine >= at then landedAt = mine end
+				if landedAt == nil and counterCue ~= nil and counterCue >= at then landedAt = counterCue end
+			end
+			if not second and now() >= secondAt then
+				second = true
+				-- only a second punch while nothing has landed: a feint cannot
+				-- punish it, and a landed first punch does not need it
+				if landedAt == nil and cfg.auto then
+					counters.counter = counters.counter + 1
+					press(cfg.counterKey, true, "counter2")
+					local h2 = now() + (cfg.counterHoldMs / 1000)
+					while now() < h2 do end
+					press(cfg.counterKey, false, "counter2")
+					log(string.format("COUNTER %s again at +%dms - the first punch produced no impact sound yet.", name, cfg.counterSecondMs))
+				end
+			end
+			wait(0.01)
+		end
+		if landedAt ~= nil then
+			SND.counterLanded = SND.counterLanded + 1
+			counters.counterHit = counters.counterHit + 1
+			log(string.format("COUNTER LANDED %s - the game's own impact sound arrived %.0fms after the punch.", name, (landedAt - at) * 1000))
+		else
+			SND.counterMissed = SND.counterMissed + 1
+			counters.counterMiss = counters.counterMiss + 1
+			log(string.format("COUNTER %s produced no impact sound inside %dms - no hit was confirmed, and a hit is the only reason to throw it.", name, cfg.counterWatchMs))
+		end
+	end)
 end
 
 -- TryAttack is CLEARED between punches, and a cleared slot is not an attack.
@@ -1386,7 +1918,7 @@ local LAND = { data = {} }
 local function landOf(name)
 	if name == nil then name = "?" end
 	if LAND.data[name] == nil then
-		LAND.data[name] = { light = {}, heavy = {}, late = {} }
+		LAND.data[name] = { light = {}, heavy = {}, late = {}, hl = {} }
 	end
 	return LAND.data[name]
 end
@@ -1424,6 +1956,24 @@ local function fuseFor(name, heavy)
 		base = cfg.feintGuardMs
 	end
 	return math.floor(clamp(base, cfg.minFireMs, cfg.maxFireMs) + 0.5)
+end
+
+-- the same arithmetic on the startup clock. The default is the delay the short
+-- script in the wild uses (250ms) and it is replaced by this opponent's own
+-- measured landings, measured from the edge, as soon as there are enough of
+-- them - so the number that script hard-codes becomes the number this file
+-- learns.
+local function hlFuseFor(name, heavy)
+	local row = landOf(name)
+	local learned = (cfg.fusePerOpp and row.hlFire ~= nil)
+	local base = learned and row.hlFire or cfg.startupMs
+	if heavy and cfg.heavyExtraMs > 0 and not learned then
+		base = base + cfg.heavyExtraMs
+	end
+	if cfg.antiFeint and cfg.feintGuardMs > 0 and base < cfg.feintGuardMs then
+		base = cfg.feintGuardMs
+	end
+	return math.floor(clamp(base, cfg.startupMinMs, cfg.startupMaxMs) + 0.5)
 end
 
 -- THE SMIDGE, and what it costs. A feint is cancelled by the stamp long before
@@ -1484,13 +2034,13 @@ local function learnWindow(name)
 	if not cfg.fusePerOpp then return end
 	local row = landOf(name)
 
-	local function apply(list, key, label, minN)
+	local function apply(list, key, label, minN, floorMs, capMs)
 		if #list < minN then return end
 		local x = medianOf(list)
 		if x == nil then return end
 		local centre, lo, hi = windowCentre(x)
 		local want = math.floor(clamp(centre,
-			math.max(cfg.minFireMs, cfg.feintGuardMs), cfg.fireMs) + 0.5)
+			floorMs or math.max(cfg.minFireMs, cfg.feintGuardMs), capMs or cfg.fireMs) + 0.5)
 		local old = row[key] or cfg.fireMs
 		if row[key] == want then return end
 		row[key] = want
@@ -1500,6 +2050,7 @@ local function learnWindow(name)
 
 	apply(row.light, "fuse", "light", cfg.fusePerOppMin)
 	apply(row.heavy, "fuseHeavy", "heavy", math.max(2, cfg.fusePerOppMin - 1))
+	apply(row.hl, "hlFire", "startup", cfg.fusePerOppMin, cfg.startupMinMs, cfg.startupMaxMs)
 end
 
 --================================ EXCHANGE =================================
@@ -1577,11 +2128,18 @@ local function score(side, pre, pressedAt)
 	return dir, want
 end
 
-local function exchange(tok, heavy, hand, reason)
+local function exchange(tok, heavy, hand, reason, startAt)
 	local opp = WORLD.opp
 	local name = opp and opp.name or "?"
-	local tokenAt = now()
-	local fuse = pressFuse(name, heavy)
+	-- THE CLOCK. The token path starts at the token. The startup path starts at
+	-- the highlight edge, which the game publishes for the attack itself - the
+	-- edge is the cheapest read here, so the window starts before the twelve
+	-- attribute reads the token path needs instead of after them. When the token
+	-- lands late the edge keeps the clock and the token only says hand / heavy /
+	-- side (see during()).
+	local clockStartup = (reason == "startup" and startAt ~= nil)
+	local tokenAt = startAt or now()
+	local fuse = clockStartup and hlFuseFor(name, heavy) or pressFuse(name, heavy)
 	local side = sideFor(hand)
 	local nd = neededSide()
 	local basis = "mapping"
@@ -1617,13 +2175,14 @@ local function exchange(tok, heavy, hand, reason)
 
 	counters.exchanges = counters.exchanges + 1
 	if cfg.verbose then
-		log(string.format("ATTEMPT %s hand=%s heavy=%s dist=%s -> %s in %dms%s%s%s  keys-you: %s",
+		log(string.format("ATTEMPT %s hand=%s heavy=%s dist=%s -> %s in %dms%s%s%s%s  keys-you: %s",
 			name, tostring(hand), heavy and "yes" or "no",
 			opp and opp.dist and string.format("%.1f", opp.dist) or "?",
 			side, fuse, basisNote,
-			(FEINT.lastWait ~= nil and FEINT.lastWait > 0)
+			(not clockStartup and FEINT.lastWait ~= nil and FEINT.lastWait > 0)
 				and string.format("  [+%dms feint patience]", FEINT.lastWait) or "",
 			(reason and reason ~= "token") and ("  [" .. reason .. "]") or "",
+			clockStartup and "  [clock = startup highlight]" or "",
 			keySnap()))
 	end
 
@@ -1641,13 +2200,32 @@ local function exchange(tok, heavy, hand, reason)
 		if cancelled ~= nil then return end
 		-- 1. the feint, from the game's own stamp, which is written ~150ms
 		--    before the press would be
-		if cfg.feintStamp and cfg.antiFeint then
-			local f = feintLive()
+		if cfg.feintStamp and (cfg.antiFeint or cfg.counter) then
+			local f = nil
+			if cfg.counter and cfg.soundCues then f = soundFeint() end
+			-- the same fake arriving late: the sound already answered it
+			if f == nil and cfg.antiFeint
+				and (ANSWERED.at == nil or (now() - ANSWERED.at) >= (cfg.feintOnceMs / 1000)) then
+				f = feintLive()
+			end
 			if f ~= nil then
 				cancelled = "feint"
 				counters.feint = counters.feint + 1
-				log(string.format("FEINT %s at +%.0fms of the token - %s. DODGE CANCELLED, no stamina spent; the follow-up token gets its own normal window.",
-					name, (now() - tokenAt) * 1000, f))
+				if clockStartup then counters.feintHl = counters.feintHl + 1 end
+				-- THE THING THE SHORT SCRIPT CANNOT DO. It presses on every
+				-- highlight, so every fake it is shown costs it a dodge. The
+				-- stamp is checked here, at the press moment, and on the startup
+				-- clock the edge bought this check the whole delay to see it.
+				log(string.format("FEINT %s at +%.0fms of the %s - %s. DODGE CANCELLED, no stamina spent; the follow-up gets its own window and the edge is watched again.",
+					name, (now() - tokenAt) * 1000, clockStartup and "startup highlight" or "token", f))
+				if cfg.counter then
+					ANSWERED.at = now()
+					counterPunch(name, f)
+				end
+				-- swallow the token this window belonged to, or the loop arms the
+				-- SAME attack again on the token path and cancels it twice
+				local t3 = readToken(WORLD.oppModel)
+				if t3 ~= nil then WORLD.tok = t3 end
 				return
 			end
 		end
@@ -1669,11 +2247,10 @@ local function exchange(tok, heavy, hand, reason)
 		--    feint defence, and it is also a double token): restart on it
 		local t2, h2, hd2 = readToken(WORLD.oppModel)
 		if t2 ~= nil and t2 ~= tok then
+			local at = now()
+			local adopt = clockStartup and (((at - tokenAt) * 1000) <= cfg.startupAdoptMs)
 			tok, heavy, hand = t2, h2, hd2
 			WORLD.tok = t2
-			tokenAt = now()
-			fuse = pressFuse(name, heavy)
-			regate = true
 			local want = sideFor(hand)
 			local live = neededSide()
 			if cfg.dirSource == "needed" and (live == "left" or live == "right") then want = live end
@@ -1683,9 +2260,21 @@ local function exchange(tok, heavy, hand, reason)
 				key = keyFor(want)
 				press(key, true, "dir")
 			end
-			counters.rearm = counters.rearm + 1
-			log(string.format("RE-ARM %s: a new token arrived while the keys were down, so the fuse restarts on it (+%dms, hand=%s).",
-				name, fuse, tostring(hand)))
+			if adopt then
+				-- the SAME attack, published after the highlight: the edge keeps
+				-- the clock and the token only fills in what it names
+				noteLead((at - tokenAt) * 1000)
+				log(string.format("TOKEN %s +%.0fms after the startup highlight - the same attack arriving late, so the clock stays on the edge (hand=%s, heavy=%s, side=%s).",
+					name, (at - tokenAt) * 1000, tostring(hand), heavy and "yes" or "no", side))
+			else
+				clockStartup = false
+				tokenAt = at
+				fuse = pressFuse(name, heavy)
+				regate = true
+				counters.rearm = counters.rearm + 1
+				log(string.format("RE-ARM %s: a new token arrived while the keys were down, so the fuse restarts on it (+%dms, hand=%s).",
+					name, fuse, tostring(hand)))
+			end
 		end
 	end
 
@@ -1752,6 +2341,10 @@ local function exchange(tok, heavy, hand, reason)
 		pressOffset = (pressedAt - tokenAt) * 1000
 		local releaseOffset = (now() - tokenAt) * 1000
 		counters.presses = counters.presses + 1
+		if clockStartup then
+			counters.hlPress = counters.hlPress + 1
+			pushSample(HL.fire, pressOffset, 12)
+		end
 		pushSample(counters.poff, pressOffset, 30)
 		log(string.format("DODGE %s %s over=%+.0fms rel=%+.0fms gap=%s stam=%s spam=%s  %s",
 			name, side, pressOffset, releaseOffset,
@@ -1882,7 +2475,14 @@ local function exchange(tok, heavy, hand, reason)
 		-- that landed with no dash at all is a landing to learn the fuse from
 		local row = landOf(name)
 		local offset = (hitAt - tokenAt) * 1000
-		pushSample(heavy and row.heavy or row.light, offset)
+		-- the landing belongs to the clock it was measured on: the startup row
+		-- teaches the startup delay, the token rows teach the token fuse, and
+		-- neither is allowed to poison the other
+		local bucket
+		if clockStartup then bucket = row.hl
+		elseif heavy then bucket = row.heavy
+		else bucket = row.light end
+		pushSample(bucket, offset)
 		if not reg then
 			log(string.format("HIT %s +%.0fms after the press, NO DASH REGISTERED so those i-frames were never up - their punch landed at +%.0fms of its token. The press was too late (or refused). %s",
 				name, early, offset, dirTxt))
@@ -2040,13 +2640,199 @@ local function inRink()
 	return false
 end
 
+--=========================== THE STARTUP ENGINE ============================
+-- The measured answer to "why does the twenty-line script dodge better":
+--   * it presses on the EDGE, not on a computed moment,
+--   * it presses AGAIN while the highlight is still up, so one refused press
+--     does not lose the attack (a refusal costs 1 stamina of 100: measured
+--     81.19 -> 80.19),
+--   * it never withholds a press.
+-- Measured in one live fight, presses 250-265ms after the edge: 5 of 7 landed,
+-- bare Space and Space-with-a-direction-key alike (3/5 and 2/3), so the
+-- direction key was never the problem. This file's gate was: 8 windows withheld,
+-- 6 of 25 presses registered. What this engine adds is the one thing the short
+-- script cannot do - the game's own IsFeinting stamp is read before EVERY press,
+-- so a fake is skipped and the punch behind it still gets pressed.
+local SLOP = { lastPress = nil, presses = 0, reg = 0, refused = 0, feints = 0, offs = {},
+	counterAt = nil }
+
+local function startupPress(opp, name, offsetMs)
+	local preLast, preStam = lastDashTime(), stamina()
+	local preH, preM, preP = health(), meter(), lastPerfect()
+	local pressedAt = now()
+	press(cfg.dodgeKey, true, "dash")
+	local hold = now() + (cfg.startupHoldMs / 1000)
+	while now() < hold do end
+	press(cfg.dodgeKey, false, "dash")
+	SLOP.presses = SLOP.presses + 1
+	counters.presses = counters.presses + 1
+	pushSample(SLOP.offs, offsetMs, 20)
+	log(string.format("DODGE %s bare %s at +%.0fms of the startup highlight (%dms hold, no direction key, nothing withheld) stam=%s",
+		name, tostring(cfg.dodgeKey), offsetMs, cfg.startupHoldMs, preStam and string.format("%.0f", preStam) or "?"))
+	-- the game's answer, off the critical path. Stamina is the signal that does
+	-- not freeze: LastDashTime sat stuck for 14-23s mid-fight in v3's log.
+	task.spawn(function()
+		local deadline = now() + 0.45
+		while now() < deadline do wait(0.02) end
+		local postLast, postStam = lastDashTime(), stamina()
+		local reg = (preLast ~= nil and postLast ~= nil and postLast ~= preLast)
+			or (preStam ~= nil and postStam ~= nil and (preStam - postStam) >= 3)
+		if reg then
+			SLOP.reg = SLOP.reg + 1
+			counters.registered = counters.registered + 1
+			if preStam ~= nil and postStam ~= nil then
+				log(string.format("REGISTERED %s - stamina %.0f -> %.0f.", name, preStam, postStam))
+			else
+				log(string.format("REGISTERED %s.", name))
+			end
+		else
+			SLOP.refused = SLOP.refused + 1
+			counters.unregistered = counters.unregistered + 1
+			-- stamina REGENERATES, so the difference can be negative - saying
+			-- "it cost -17.6" is exactly the kind of number that reads like a
+			-- bug. Only a spend is reported as a cost.
+			local spent = (preStam ~= nil and postStam ~= nil) and (preStam - postStam) or nil
+			log(string.format("REFUSED %s - the game took the press and did not dash. %s", name,
+				(spent ~= nil and spent > 0.5) and string.format("It cost %.1f stamina, so the next press in this window is still worth sending.", spent)
+					or "Refusals are close to free, so the next press in this window is still worth sending."))
+		end
+		-- the outcome, on the same clock as the press. The old engine scored
+		-- this from its landing watch; the startup engine needs it to say
+		-- anything about whether the dodge worked.
+		local h2, m2, p2 = health(), meter(), lastPerfect()
+		local hurt = (preH ~= nil and h2 ~= nil and h2 < (preH - 0.5))
+		local moved = (preM ~= nil and m2 ~= nil and m2 > (preM + 0.5))
+			or (preP ~= nil and p2 ~= nil and p2 ~= preP)
+		counters.exchanges = counters.exchanges + 1
+		if hurt then
+			counters.hit = counters.hit + 1
+			-- this read happens once, %.0fms is the AGE OF THE READ, not the
+			-- punch's landing time - saying "it landed at 571ms" was wrong and
+			-- read as a measurement it had not made
+			log(string.format("TOOK DAMAGE %s within %.0fms of the press (the read is one sample, so this says the window failed, not when).", name, (now() - (pressedAt or now())) * 1000))
+		elseif moved then
+			counters.perfect = counters.perfect + 1
+			log(string.format("PERFECT %s - no damage and the meter moved.", name))
+		else
+			counters.clean = counters.clean + 1
+		end
+	end)
+end
+
+local function startupTick(opp)
+	local edge = nil
+	if cfg.startupClock then edge = hlEdge(opp) end
+	local nowT = now()
+	if edge ~= nil then
+		HL.dueAt = edge + (cfg.startupMs / 1000)
+		SLOP.lastPress = nil
+		SLOP.counterAt = nil
+	end
+	-- THE CONDITION IS THE SCRIPT'S OWN CONDITION: the instance is up. Nothing
+	-- else is asked before the press except "am I on a canvas" and "have I the
+	-- stamina to pay for it" - no dash-gap gate, no fuse arithmetic, no token.
+	if not HL.on then return end
+	-- THE COUNTER'S HOLD. A fake leaves the highlight up, so without this the
+	-- repeat press would dodge the fake about 110ms after the counter saved the
+	-- dodge. It ends on the first of: a new highlight edge (handled above), a
+	-- NEW opponent Swing/SwingBig sound - which is the real punch behind the
+	-- fake, written ~130ms after that punch starts - or the ceiling.
+	if SLOP.counterAt ~= nil then
+		local swingSince = (SND.lastSwingAt ~= nil and SND.lastSwingAt >= SLOP.counterAt)
+		if swingSince or (nowT - SLOP.counterAt) >= (cfg.counterHoldOffMs / 1000) then
+			SLOP.counterAt = nil
+		else
+			return
+		end
+	end
+	local due = HL.dueAt or (nowT - 1)
+	if nowT < due then return end
+	if SLOP.lastPress ~= nil and (nowT - SLOP.lastPress) < (cfg.startupRepeatMs / 1000) then return end
+	if not cfg.auto then return end
+	if cfg.requireRink then
+		local inside = inRink()
+		RINK.last = inside
+		if inside == false then
+			counters.rinkSkip = counters.rinkSkip + 1
+			if counters.rinkSkip == 1 then
+				log("OUTSIDE THE RINK: the opponent is still locked on and still throwing, but this character is not on a canvas - nothing is pressed until you step in.")
+			end
+			return
+		end
+	end
+	local st = stamina()
+	if cfg.minStamina > 0 and st ~= nil and st < cfg.minStamina then return end
+	SLOP.lastPress = nowT
+	local name = opp and opp.name or "?"
+	local offset = (nowT - (HL.at or nowT)) * 1000
+	-- THE FEINT, in the order the tells arrive:
+	--   1. the feint SOUND (~50ms after the attempt - measured),
+	--   2. the IsFeinting stamp (330-400ms after it - measured),
+	-- and the answer to either is the same one a feint is designed to prevent:
+	-- no dodge is spent, a PUNCH goes out into the recovery, and the real punch
+	-- behind the fake still gets its own edge and its own dodge.
+	if cfg.antiFeint or cfg.counter then
+		local f, tag = nil, nil
+		if cfg.counter and cfg.soundCues then
+			f = soundFeint()
+			if f ~= nil then tag = "sound" end
+		end
+		if f == nil and cfg.antiFeint and cfg.feintStamp then
+			-- the same fake arriving late: the sound already answered it
+			if ANSWERED.at ~= nil and (nowT - ANSWERED.at) < (cfg.feintOnceMs / 1000) then
+				ANSWERED.skips = ANSWERED.skips + 1
+			else
+				f = feintLive()
+				if f ~= nil then tag = "stamp" end
+			end
+		end
+		if f ~= nil then
+			SLOP.feints = SLOP.feints + 1
+			counters.feint = counters.feint + 1
+			counters.feintHl = counters.feintHl + 1
+			if tag == "sound" then
+				counters.feintSound = counters.feintSound + 1
+			else
+				counters.feintStamp = counters.feintStamp + 1
+			end
+			if cfg.counter then
+				-- no dodge for the rest of THIS attempt: see counterHoldOffMs and
+				-- the release in startupTick. The real punch behind the fake is a
+				-- new edge (or its own Swing sound), and either one ends the hold.
+				SLOP.lastPress = nowT
+				SLOP.counterAt = nowT
+				ANSWERED.at = nowT
+				counterPunch(name, f)
+			else
+				log(string.format("FEINT %s at +%.0fms of the startup highlight - %s. NO PRESS: the short script in the wild dodges this fake, and that is the whole difference. The punch behind it gets its own edge.",
+					name, offset, f))
+			end
+			return
+		end
+	end
+	startupPress(opp, name, offset)
+end
+
 local function tick()
 	local opp = refresh()
 	if opp == nil then return end
+	-- the sound cues are polled once per tick, before either engine looks at
+	-- the attempt: a feint cue is written ~50ms after the fake starts, so it has
+	-- to be seen on the same tick the press decision is made on
+	sndPoll(opp.name)
+	-- the attempt clock the sound tell is judged against (one attribute read)
+	local tokNow = readToken(opp.model)
+	if tokNow ~= nil and tokNow ~= TOKN.v then TOKN.v, TOKN.at = tokNow, now() end
+	if cfg.engine == "startup" then return startupTick(opp) end
+	-- THE EDGE IS READ FIRST, before any attribute. It is one exists-check, so
+	-- it is the cheapest thing in this tick, and starting the clock on it means
+	-- the window begins before the token's reads rather than after them.
+	local edge = nil
+	if cfg.startupClock then edge = hlEdge(opp) end
 	local tok, heavy, hand = readToken(opp.model)
-	if tok == nil then return end
-	if tok == WORLD.tok then return end
-	WORLD.tok = tok
+	local fresh = (tok ~= nil and tok ~= WORLD.tok)
+	if edge == nil and not fresh then return end
+	if fresh then WORLD.tok = tok end
 	if not cfg.auto then return end
 	-- THE RINK GATE. The token is published whether or not this character is in
 	-- the fight, so the only honest question is where the character is standing.
@@ -2061,7 +2847,7 @@ local function tick()
 			return
 		end
 	end
-	local ok, err = pcall(exchange, tok, heavy, hand, "token")
+	local ok, err = pcall(exchange, tok, heavy, hand, edge and "startup" or "token", edge)
 	if not ok then
 		warn("exchange error (ignored, the loop keeps going): " .. tostring(err))
 	end
@@ -2097,6 +2883,15 @@ local function statusLine()
 		.. string.format(" | rink=%s withheld=%d | feint-waited=%d of %d (patience %dms, cut %s)",
 			rinkWord(), counters.rinkSkip, counters.feintWait, counters.exchanges,
 			cfg.feintPatienceMs, FEINT.cutAt and "yes" or "no")
+		.. string.format(" | startup edges=%d presses=%d feint-cancels=%d",
+			HL.seen, counters.hlPress, counters.feintHl)
+		.. string.format(" | engine=%s edges=%d presses=%d reg=%d refused=%d feint-skips=%d",
+			cfg.engine, HL.seen, SLOP.presses, SLOP.reg, SLOP.refused, SLOP.feints)
+		.. string.format(" | sound cues=%d feint-cues=%d stale=%d | counter fired=%d landed=%d missed=%d (tell: sound=%d stamp=%d, repeats skipped=%d)",
+			SND.n, SND.feints, SND.stale, counters.counter, counters.counterHit, counters.counterMiss,
+			counters.feintSound, counters.feintStamp, ANSWERED.skips)
+		.. string.format(" | keys dash=%s (%s) counter=%s",
+			tostring(cfg.dodgeKey), tostring(KEYS.from), tostring(cfg.counterKey))
 end
 
 local LOOP = { started = false }
@@ -2154,6 +2949,7 @@ function D.status()
 	print("[D] " .. statusLine())
 	print("[D] " .. timingLine())
 	print("[D] " .. ledgerLine())
+	print("[D] " .. hlLine())
 	local blocked, why = stunVerdict()
 	print(string.format("[D] stun: %s (%s)", blocked and "REFUSING" or "clear", why))
 	print("[D] " .. capsLine())
@@ -2275,7 +3071,7 @@ function D.presstest()
 		warn("PRESSTEST needs the character's LastDashTime - _G.D.dump() shows whether it is readable.")
 		return false
 	end
-	log("PRESSTEST: one Space press, judged by the game's own LastDashTime. No opponent, no timing.")
+	log(string.format("PRESSTEST: one %s press, judged by the game's own LastDashTime. No opponent, no timing.", tostring(cfg.dodgeKey)))
 	press(cfg.dodgeKey, true, "test")
 	local hold = now() + (cfg.pressHoldMs / 1000)
 	while now() < hold do end
@@ -2315,6 +3111,51 @@ function D.feint()
 	return FEINT.seen, counters.feint
 end
 
+-- the keys the game actually binds, read out of its own widget
+function D.key()
+	readKeybinds(false)
+	print(string.format("[D] dash=%s  counter=%s  heavy=%s  block=%s  quick=%s   (from %s)",
+		tostring(cfg.dodgeKey), tostring(cfg.counterKey), tostring(KEYS.heavy or "?"),
+		tostring(KEYS.block or "?"), tostring(KEYS.quick or "?"), tostring(KEYS.from)))
+	if KEYS.read < 2 then
+		print("[D]   only " .. tostring(KEYS.read) .. " bind(s) could be read. The widget is built on load; if it is missing, open the menu once and call this again. The cfg default is " .. tostring(cfg.dodgeKey) .. ".")
+	end
+	return cfg.dodgeKey, cfg.counterKey
+end
+
+-- the sound cues: what the game wrote, when, and which tell is live
+function D.snd(tail)
+	local root = sndDebris()
+	print(string.format("[D] SOUND: Debris=%s cues=%d scans=%d | feint-cues=%d swings=%d hits=%d",
+		root and "yes" or "NO", SND.n, SND.scans, SND.feints, SND.swings, SND.hits))
+	if SND.lastFeintAt ~= nil then
+		print(string.format("[D]   last feint cue %s %+.0fms ago; it stays actionable for %dms (soundFeintWindowMs). Counter key %s.",
+			tostring(SND.lastFeintName), (now() - SND.lastFeintAt) * 1000, cfg.soundFeintWindowMs, tostring(cfg.counterKey)))
+	end
+	print(string.format("[D]   counters fired=%d landed=%d missed=%d | tells: sound=%d stamp=%d",
+		counters.counter, counters.counterHit, counters.counterMiss, counters.feintSound, counters.feintStamp))
+	local n = tonumber(tail) or 8
+	local from = math.max(1, #SND.cues - n + 1)
+	for i = from, #SND.cues do
+		local c = SND.cues[i]
+		print(string.format("[D]   %+7.0fms  %-22s %s", (now() - c.t) * 1000, tostring(c.n), tostring(c.h)))
+	end
+	if root == nil then
+		print("[D]   workspace.Debris is not there - the sound path is dead in this place, and the IsFeinting stamp is the only feint tell left.")
+	end
+	return SND.n
+end
+
+-- one counter-punch, on demand: the same code the feint path runs
+function D.counter()
+	local name = (WORLD.opp ~= nil and WORLD.opp.name) or "?"
+	if WORLD.opp == nil then
+		warn("COUNTER test with no opponent: the punch still goes out, but nothing will confirm a hit. Use it in a fight.")
+	end
+	counterPunch(name, "manual test (no feint)")
+	return true
+end
+
 -- the rink gate, answered with the numbers it used
 function D.rink()
 	local parts = rinkParts()
@@ -2348,6 +3189,44 @@ function D.dirs()
 	print(string.format("[D] the default side is dirSource=%s; dirAuto=%s (>=8 judged, >=3 perfects, 3-perfect lead), fist fallback=%s",
 		tostring(cfg.dirSource), tostring(cfg.dirAuto), tostring(cfg.dirFistFallback)))
 	print(string.format("[D] last press would have used: %s", tostring(D.side() or "?")))
+end
+
+function D.hl(name)
+	if type(name) == "string" then
+		-- asked about a name rather than the current opponent: does that rig
+		-- even have the instance right now? This is the live check the notes
+		-- kept asking for - only existence is readable, so existence is what
+		-- gets reported.
+		local rig = hlRigFor(nil, name)
+		local sh = nil
+		pcall(function() sh = rig and rig:FindFirstChild("StartupHighlight") end)
+		print(string.format("[D] weld rig %s: %s, StartupHighlight=%s", name,
+			rig and "found" or "MISSING", tostring(sh ~= nil)))
+		return
+	end
+	print("[D] " .. hlLine())
+	local fire = medianOf(HL.fire)
+	local lead = medianOf(HL.lead)
+	print(string.format("[D]   startupMs=%d learned-here=%s  token-lag=%s  (the delay is learned from landings measured from the edge, per opponent)",
+		cfg.startupMs,
+		fire and string.format("%.0fms over %d press(es)", fire, #HL.fire) or "not yet",
+		lead and string.format("%.0fms (n=%d)", lead, #HL.lead) or "not yet"))
+	local names = {}
+	for k in pairs(LAND.data) do names[#names + 1] = k end
+	table.sort(names)
+	for _, k in ipairs(names) do
+		local row = LAND.data[k]
+		local hf = medianOf(row.hl)
+		local tf = medianOf(row.light)
+		if hf ~= nil or tf ~= nil or row.hlFire ~= nil or row.fuse ~= nil then
+			print(string.format("[D]   %-18s startup: landing %s -> delay %s | token: landing %s -> fuse %s", k,
+				hf and string.format("%.0fms", hf) or "-", row.hlFire and (row.hlFire .. "ms") or "-",
+				tf and string.format("%.0fms", tf) or "-", row.fuse and (row.fuse .. "ms") or "-"))
+		end
+	end
+	if hlSetting() == false then
+		print("[D]   ShinyStartups reads OFF - but this build still parents the highlight with it off (measured live), so the edge is in use regardless. It is reported, not gated on.")
+	end
 end
 
 function D.land()
@@ -2458,6 +3337,10 @@ D.counters = counters
 
 --================================= BOOT ====================================
 pcall(capsProbe)
+-- THE KEYS ARE READ BEFORE ANYTHING IS PRESSED. Build 4 pressed Space for a
+-- whole session against a game that binds Dash to X; the widget is the
+-- authority and it costs six FindFirstChild calls here.
+if cfg.readKeybinds then pcall(readKeybinds, false) end
 if cfg.watchKeys then pcall(keyTestListen) end
 
 if ENV.keypress == nil and ENV.vim == nil then
@@ -2474,10 +3357,15 @@ log(string.format("  fuse: fireMs=%d (+%d heavy, only when measured late), per-o
 	cfg.fireMs, cfg.heavyExtraMs, cfg.fusePerOppMin, cfg.feintGuardMs))
 log(string.format("  feints: patience +%dms against an opponent that has already feinted, cut back to the room their measured landing leaves. _G.D.feint() shows the stamps and the clock.",
 	cfg.feintPatienceMs))
-log(string.format("  gate: minDashGapMs=%d (bracketed by a refusal at 1219ms and the game's own 1467ms), spam>=%s, stamina<%d, and ONE stun verdict (the flag only refuses while StunnedUntil is AHEAD)",
-	cfg.minDashGapMs,
-	cfg.maxSpamLevel and string.format("%.2f", cfg.maxSpamLevel) or "off (the meter is not 0..1 here - _G.D.spam() shows the range)",
-	cfg.minStamina))
+log(string.format("  startup: %s - the game's own StartupHighlight is the clock when it exists (ShinyStartups reads %s, and the highlight appears either way; delay %dms until this opponent's landings replace it). The feint veto runs before the press, which is the one thing the short script in the wild cannot do. _G.D.hl() reports it.",
+	cfg.startupClock and "ON" or "off", tostring(hlSetting()), cfg.startupMs))
+log(string.format("  engine: %s%s", cfg.engine,
+	cfg.engine == "startup"
+		and string.format(" - press on the StartupHighlight edge at +%dms, bare %s held %dms, again every %dms while it is up; ONLY two things can withhold it: not being on a canvas, and stamina below %d. No dash-gap gate: it withheld 8 windows and dropped registration from ~60%% to 24%% in one measured fight.", cfg.startupMs, tostring(cfg.dodgeKey), cfg.startupHoldMs, cfg.startupRepeatMs, cfg.minStamina)
+		or string.format(" - the fuse engine: token clock, fireMs=%d, minDashGapMs=%d, spam>=%s", cfg.fireMs, cfg.minDashGapMs,
+			cfg.maxSpamLevel and string.format("%.2f", cfg.maxSpamLevel) or "off")))
+log(string.format("  sound: %s - the game's own cues in Workspace.Debris. A feint writes Feint + Feint2 + FeintRustle into Debris.SoundPart ~50ms after the attempt (measured live), against 330-400ms for the IsFeinting stamp, so the feint tell is now the sound. _G.D.snd() lists the tail, _G.D.set(\"soundCues\", false) turns it off.", cfg.soundCues and "ON" or "off"))
+log(string.format("  counter: %s - a feint is answered with %s (light attack, read from the keybinds) instead of a dodge: a fake has no hitbox, so the punch is free, and a second one goes out if the first produces no impact sound. The game's own hit sound says COUNTER LANDED. _G.D.counter() fires one by hand.", cfg.counter and "ON" or "off", tostring(cfg.counterKey)))
 log(string.format("  direction: %s at the press, %s through the pre-hold every %dms; base mapping %s + dirRule=%s, so LeftHand -> %s key",
 	cfg.dirSource, cfg.neededPoll and "re-read" or "not re-read", cfg.neededPollMs,
 	"handMap", cfg.dirRule, tostring(sideFor("LeftHand"))))
